@@ -44,7 +44,7 @@ struct DAGTask {
     }
 
     // Kahn 拓扑排序
-    std::vector<int> topological_sort() const {
+    std::vector<int> topo() const {
         std::unordered_map<int, int> in_deg;
         for (auto &[vid, v] : vertices) in_deg[vid] = (int)v.preds.size();
 
@@ -69,7 +69,7 @@ struct DAGTask {
         for (auto &[vid, v] : vertices) C += v.wcet;
         if (period > EPS) U = C / period; else U = 0.0;
 
-        auto topo = topological_sort();
+        auto topo = this->topo();
 
         // forward pass: rdy
         for (int vid : topo) {

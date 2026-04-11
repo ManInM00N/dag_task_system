@@ -7,10 +7,12 @@ LIB_OBJS = build/decomposition.o build/gedf_simulator.o \
 OBJS = build/main.o $(LIB_OBJS)
 HDRS = include/dag_model.h include/decomposition.h include/gedf_simulator.h \
 	include/gedf_variants.h include/vertex_reassemble.h \
-	include/dag_generators.h include/json.hpp
+	include/dag_generators.h include/json.hpp include/stg_parser.h
+ 
 
 TESTS = dag_model_test decomposition_test gedf_simulator_test \
-	 gedf_variants_test overhead_test precision_test dag_generators_test
+	 gedf_variants_test overhead_test precision_test dag_generators_test \
+	 sample_graphs gen_tool
 TEST_BINS = $(addprefix build/,$(TESTS))
 TEST_OBJS = $(addprefix build/,$(addsuffix .o,$(TESTS)))
 
@@ -44,6 +46,12 @@ build/dag_generators.o: src/dag_generators.cpp $(HDRS) | build
 build/%.o: tests/%.cpp $(HDRS) tests/test_utils.h | build
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+build/gen_tool.o: utils/gen_tool.cpp $(HDRS) | build
+	$(CXX) $(CXXFLAGS) -c utils/gen_tool.cpp -o build/gen_tool.o
+
+build/std_parser.o: src/stg_parser.cpp $(HDRS) | build
+	$(CXX) $(CXXFLAGS) -c src/stg_parser.cpp -o build/std_parser.o
+	
 build:
 	mkdir -p build
 
