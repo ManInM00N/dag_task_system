@@ -61,13 +61,14 @@ build:
 	mkdir -p build
 
 output:
-	mkdir -p output
+	@if not exist output mkdir output
 
 run: $(TARGET) | output
-	./$(TARGET) output/results.json
+	$(TARGET) output/results.json
 
 plot: run
 	python3 plot_results.py output/results.json output
 
 clean:
-	rm -rf build output
+	@if exist build rmdir /s /q build
+	@if exist output rmdir /s /q output
