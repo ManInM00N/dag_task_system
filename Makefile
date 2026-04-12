@@ -3,11 +3,13 @@ CXXFLAGS = -std=c++17 -O2 -Wall -Wextra -Iinclude
 TARGET   = build/dag_simulator
 
 LIB_OBJS = build/decomposition.o build/gedf_simulator.o \
-	    build/gedf_variants.o build/dag_generators.o
+	    build/gedf_variants.o build/dag_generators.o \
+	    build/stg_parser.o build/wfcommons_parser.o
 OBJS = build/main.o $(LIB_OBJS)
 HDRS = include/dag_model.h include/decomposition.h include/gedf_simulator.h \
 	include/gedf_variants.h include/vertex_reassemble.h \
-	include/dag_generators.h include/json.hpp include/stg_parser.h
+	include/dag_generators.h include/json.hpp include/stg_parser.h \
+	include/wfcommons_parser.h
  
 
 TESTS = dag_model_test decomposition_test gedf_simulator_test \
@@ -49,8 +51,11 @@ build/%.o: tests/%.cpp $(HDRS) tests/test_utils.h | build
 build/gen_tool.o: utils/gen_tool.cpp $(HDRS) | build
 	$(CXX) $(CXXFLAGS) -c utils/gen_tool.cpp -o build/gen_tool.o
 
-build/std_parser.o: src/stg_parser.cpp $(HDRS) | build
-	$(CXX) $(CXXFLAGS) -c src/stg_parser.cpp -o build/std_parser.o
+build/stg_parser.o: src/stg_parser.cpp $(HDRS) | build
+	$(CXX) $(CXXFLAGS) -c src/stg_parser.cpp -o build/stg_parser.o
+
+build/wfcommons_parser.o: src/wfcommons_parser.cpp $(HDRS) | build
+	$(CXX) $(CXXFLAGS) -c src/wfcommons_parser.cpp -o build/wfcommons_parser.o
 	
 build:
 	mkdir -p build

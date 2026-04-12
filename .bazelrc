@@ -1,0 +1,18 @@
+# Bazel 构建配置
+build --cxxopt=-std=c++17
+build --host_cxxopt=-std=c++17
+build --color=yes
+build --verbose_failures
+build --jobs=auto
+
+# 优化构建
+build:opt --compilation_mode=opt
+build:opt --copt=-O2
+
+# 调试构建
+build:dbg --compilation_mode=dbg
+build:dbg --copt=-g
+
+# 测试配置
+test --test_output=errors
+test --test_verbose_timeout_warnings

@@ -14,6 +14,7 @@
 #include <cmath>
 #include <algorithm>
 #include <random>
+#include <filesystem>
 
 #include "dag_model.h"
 #include "decomposition.h"
@@ -22,6 +23,8 @@
 #include "vertex_reassemble.h"
 #include "dag_generators.h"
 #include "json.hpp"
+#include "stg_parser.h"
+#include "wfcommons_parser.h"
 
 using std::cout;
 using std::endl;
@@ -655,7 +658,7 @@ static nlohmann::json run_precision_evaluation() {
 // =====================================================================
 //  Part 8: STG Dataset Validation
 // =====================================================================
-static void run_stg_experiment(JsonWriter &jw, const std::string &stg_dir) {
+static nlohmann::json run_stg_experiment(const std::string &stg_dir) {
     cout << "\n" << std::string(70, '=') << endl;
     cout << "PART 8: STG Dataset Validation (" << stg_dir << ")" << endl;
     cout << std::string(70, '=') << endl;
@@ -664,18 +667,17 @@ static void run_stg_experiment(JsonWriter &jw, const std::string &stg_dir) {
     auto stg_tasks_raw = load_stg_directory(stg_dir, 0.4, 10, 42);
     if (stg_tasks_raw.empty()) {
         printf("  No STG files found, skipping.\n");
-        jw.key("stg_experiment"); jw.begin_object();
-        jw.kv("status", std::string("no_data"));
-        jw.end_object();
-        return;
+        nlohmann::json j;
+        j["status"] = "no_data";
+        return j;
     }
     printf("  Loaded %d DAGs from STG\n", (int)stg_tasks_raw.size());
  
-    jw.key("stg_experiment"); jw.begin_object();
-    jw.kv("num_dags", (int)stg_tasks_raw.size());
+    nlohmann::json j;
+    j["num_dags"] = (int)stg_tasks_raw.size();
  
     double util_levels[] = {0.2, 0.3, 0.4, 0.5, 0.6};
-    jw.key("by_util"); jw.begin_array();
+    nlohmann::json by_util = nlohmann::json::array();
  
     for (double u : util_levels) {
         auto tasks = stg_tasks_raw;
@@ -706,27 +708,122 @@ static void run_stg_experiment(JsonWriter &jw, const std::string &stg_dir) {
                u, (int)subset.size(), sched.schedulable?"Y":"N",
                sim.schedulable?"Y":"N", avg_p*100);
  
-        jw.begin_object();
-        jw.kv("util_norm", u); jw.kv("n_tasks", (int)subset.size());
-        jw.kv("analytical", sched.schedulable);
-        jw.kv("simulation", sim.schedulable);
-        jw.kv("avg_precision", avg_p);
-        jw.key("tasks"); jw.begin_array();
+        nlohmann::json entry;
+        entry["util_norm"] = u;
+        entry["n_tasks"] = (int)subset.size();
+        entry["analytical"] = sched.schedulable;
+        entry["simulation"] = sim.schedulable;
+        entry["avg_precision"] = avg_p;
+        nlohmann::json tasks_arr = nlohmann::json::array();
         for (size_t i = 0; i < subset.size(); ++i) {
-            jw.begin_object();
-            jw.kv("n_v", (int)subset[i].vertices.size());
-            jw.kv("C", subset[i].C); jw.kv("L", subset[i].L);
-            jw.kv("T", subset[i].period); jw.kv("U", subset[i].U);
-            jw.kv("omega", decomps[i].omega);
+            nlohmann::json tj;
+            tj["n_v"] = (int)subset[i].vertices.size();
+            tj["C"] = subset[i].C;
+            tj["L"] = subset[i].L;
+            tj["T"] = subset[i].period;
+            tj["U"] = subset[i].U;
+            tj["omega"] = decomps[i].omega;
             if (sim.wcrt.count(subset[i].task_id))
-                jw.kv("wcrt", sim.wcrt.at(subset[i].task_id));
-            jw.end_object();
+                tj["wcrt"] = sim.wcrt.at(subset[i].task_id);
+            tasks_arr.push_back(tj);
         }
-        jw.end_array();
-        jw.end_object();
+        entry["tasks"] = tasks_arr;
+        by_util.push_back(entry);
     }
-    jw.end_array();
-    jw.end_object();
+    j["by_util"] = by_util;
+    return j;
+}
+
+// =====================================================================
+//  Part 9: WfInstances (WfCommons) Dataset Validation
+// =====================================================================
+static nlohmann::json run_wfinstances_experiment(const std::string &wf_path) {
+    cout << "\n" << std::string(70, '=') << endl;
+    cout << "PART 9: WfInstances Dataset Validation (" << wf_path << ")" << endl;
+    cout << std::string(70, '=') << endl;
+
+    int m = 8;
+
+    // 尝试作为目录批量加载，或作为单个 JSON 文件加载
+    std::vector<DAGTask> wf_tasks_raw;
+    namespace fs = std::filesystem;
+    if (fs::is_directory(wf_path)) {
+        wf_tasks_raw = load_wfinstances_directory(wf_path, 0.4, 10, 42);
+    } else {
+        auto t = load_wfinstances_file(wf_path, 0);
+        if (!t.vertices.empty()) {
+            assign_period(t, 0.4, 42, 3.0);
+            wf_tasks_raw.push_back(t);
+        }
+    }
+
+    if (wf_tasks_raw.empty()) {
+        printf("  No WfInstances data found, skipping.\n");
+        nlohmann::json j;
+        j["status"] = "no_data";
+        return j;
+    }
+    printf("  Loaded %d DAGs from WfInstances\n", (int)wf_tasks_raw.size());
+
+    nlohmann::json j;
+    j["num_dags"] = (int)wf_tasks_raw.size();
+
+    double util_levels[] = {0.2, 0.3, 0.4, 0.5, 0.6};
+    nlohmann::json by_util = nlohmann::json::array();
+
+    for (double u : util_levels) {
+        auto tasks = wf_tasks_raw;
+        std::mt19937 rng((unsigned)(u * 10000));
+        for (auto &t : tasks) assign_period(t, u, rng(), 3.0);
+
+        // 保留 U_sum <= m 的子集
+        std::vector<DAGTask> subset;
+        double Usub = 0;
+        for (auto &t : tasks) {
+            if (t.L > t.period + EPS) continue;
+            if (Usub + t.U > m) break;
+            subset.push_back(t); Usub += t.U;
+        }
+        if (subset.empty()) continue;
+
+        auto decomps = decompose_taskset(subset);
+        auto sched = check_schedulability_gedf(subset, decomps, m);
+        auto sim = simulate_gedf(m, subset, decomps, 5);
+        auto prec = evaluate_precision(subset, decomps, sim, m);
+
+        double avg_p = 0; int pc = 0;
+        for (auto &pr : prec)
+            if (pr.precision > EPS && pr.precision <= 1.0 + EPS) { avg_p += pr.precision; ++pc; }
+        if (pc > 0) avg_p /= pc;
+
+        printf("  U/m=%.1f: %d tasks, ana=%s sim=%s prec=%.1f%%\n",
+               u, (int)subset.size(), sched.schedulable?"Y":"N",
+               sim.schedulable?"Y":"N", avg_p*100);
+
+        nlohmann::json entry;
+        entry["util_norm"] = u;
+        entry["n_tasks"] = (int)subset.size();
+        entry["analytical"] = sched.schedulable;
+        entry["simulation"] = sim.schedulable;
+        entry["avg_precision"] = avg_p;
+        nlohmann::json tasks_arr = nlohmann::json::array();
+        for (size_t i = 0; i < subset.size(); ++i) {
+            nlohmann::json tj;
+            tj["n_v"] = (int)subset[i].vertices.size();
+            tj["C"] = subset[i].C;
+            tj["L"] = subset[i].L;
+            tj["T"] = subset[i].period;
+            tj["U"] = subset[i].U;
+            tj["omega"] = decomps[i].omega;
+            if (sim.wcrt.count(subset[i].task_id))
+                tj["wcrt"] = sim.wcrt.at(subset[i].task_id);
+            tasks_arr.push_back(tj);
+        }
+        entry["tasks"] = tasks_arr;
+        by_util.push_back(entry);
+    }
+    j["by_util"] = by_util;
+    return j;
 }
 
 // =====================================================================
@@ -734,7 +831,21 @@ static void run_stg_experiment(JsonWriter &jw, const std::string &stg_dir) {
 // =====================================================================
 int main(int argc, char *argv[]) {
     std::string output_path = "output/results.json";
-    if (argc > 1) output_path = argv[1];
+    std::string stg_dir = "";
+    std::string wf_path = "";
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--stg" && i + 1 < argc) {
+            stg_dir = argv[++i];
+        } else if (arg == "--wf" && i + 1 < argc) {
+            wf_path = argv[++i];
+        } else if (arg == "-o" && i + 1 < argc) {
+            output_path = argv[++i];
+        } else if (output_path == "output/results.json") {
+            output_path = arg;
+        }
+    }
 
     nlohmann::json root;
 
@@ -747,6 +858,16 @@ int main(int argc, char *argv[]) {
     root["high_elasticity"] = high_and_ov["high_elasticity"];
     root["overhead_comparison"] = high_and_ov["overhead_comparison"];
     root["precision_evaluation"] = run_precision_evaluation();
+
+    // STG 数据集实验
+    if (!stg_dir.empty()) {
+        root["stg_experiment"] = run_stg_experiment(stg_dir);
+    }
+
+    // WfInstances 数据集实验
+    if (!wf_path.empty()) {
+        root["wfinstances_experiment"] = run_wfinstances_experiment(wf_path);
+    }
 
     std::ofstream ofs(output_path);
     if (!ofs) { std::cerr << "Failed to open " << output_path << endl; return 1; }

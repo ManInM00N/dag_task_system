@@ -1,1 +1,6 @@
 build/*
+bazel-bin/
+bazel-out/
+bazel-testlogs/
+bazel-dag_task_system/
+output/
