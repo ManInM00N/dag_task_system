@@ -129,6 +129,7 @@ void assign_period(DAGTask &task, double util_norm,
 
 // ================================================================
 //  load_stg_directory: 从目录批量加载 .stg 文件
+//  max_files < 0 表示全量加载
 // ================================================================
 std::vector<DAGTask> load_stg_directory(const std::string &dirpath,
                                          double util_norm,
@@ -151,7 +152,9 @@ std::vector<DAGTask> load_stg_directory(const std::string &dirpath,
 
     std::sort(stg_files.begin(), stg_files.end());
 
-    int count = std::min(max_files, (int)stg_files.size());
+    int count = (max_files < 0)
+                    ? (int)stg_files.size()
+                    : std::min(max_files, (int)stg_files.size());
     std::mt19937 rng(seed);
 
     for (int i = 0; i < count; ++i) {
@@ -175,4 +178,68 @@ std::vector<DAGTask> load_stg_by_size(const std::string &base_dir,
                                        unsigned seed) {
     std::string dir = base_dir + "/rnc" + std::to_string(size);
     return load_stg_directory(dir, util_norm, max_files, seed);
+}
+
+// ================================================================
+//  load_stg_auto: 自动探测目录布局
+//    1) 若 base_dir 自身含 *.stg，作为一个分组 "root" 加载
+//    2) 否则，遍历 base_dir 下一级子目录，把所有包含 *.stg 的子目录
+//       各自作为一组加载（分组名即子目录名，例如 "50" / "100" / "rnc50"）
+//    加载后的 DAG period=0，需调用 assign_period 才能做调度分析。
+// ================================================================
+std::vector<StgGroup> load_stg_auto(const std::string &base_dir,
+                                     int max_files_per_group,
+                                     unsigned seed) {
+    std::vector<StgGroup> groups;
+    if (!fs::exists(base_dir)) {
+        std::cerr << "STG base dir not found: " << base_dir << std::endl;
+        return groups;
+    }
+
+    auto collect_from = [&](const std::string &dir, const std::string &label) {
+        std::vector<std::string> files;
+        for (auto &entry : fs::directory_iterator(dir)) {
+            if (entry.is_regular_file() && entry.path().extension() == ".stg")
+                files.push_back(entry.path().string());
+        }
+        if (files.empty()) return;
+        std::sort(files.begin(), files.end());
+
+        int count = (max_files_per_group < 0)
+                        ? (int)files.size()
+                        : std::min(max_files_per_group, (int)files.size());
+
+        StgGroup g; g.label = label;
+        int next_id = 0;
+        for (int i = 0; i < count; ++i) {
+            DAGTask t = load_stg_file(files[i], next_id++);
+            if (t.vertices.empty()) continue;
+            g.tasks.push_back(std::move(t));
+        }
+        if (!g.tasks.empty()) groups.push_back(std::move(g));
+    };
+
+    // 1) base_dir 自身是否含 .stg？
+    bool has_stg_at_root = false;
+    for (auto &entry : fs::directory_iterator(base_dir)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".stg") {
+            has_stg_at_root = true; break;
+        }
+    }
+    if (has_stg_at_root) {
+        collect_from(base_dir, fs::path(base_dir).filename().string());
+        return groups;
+    }
+
+    // 2) 遍历一级子目录
+    std::vector<fs::path> subs;
+    for (auto &entry : fs::directory_iterator(base_dir))
+        if (entry.is_directory()) subs.push_back(entry.path());
+    std::sort(subs.begin(), subs.end());
+
+    for (auto &sub : subs) {
+        collect_from(sub.string(), sub.filename().string());
+    }
+    (void)seed; // 保留签名，周期分配时在外层控制随机性
+    return groups;
 }

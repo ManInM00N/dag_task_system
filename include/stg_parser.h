@@ -32,6 +32,7 @@ void assign_period(DAGTask &task, double util_norm,
 
 // 从一个目录批量加载 STG 文件
 // 选取前 max_files 个 .stg 文件，按 util_norm 分配周期
+// max_files < 0 表示"不限数量，全部加载"
 std::vector<DAGTask> load_stg_directory(const std::string &dirpath,
                                          double util_norm,
                                          int max_files = 10,
@@ -44,3 +45,17 @@ std::vector<DAGTask> load_stg_by_size(const std::string &base_dir,
                                        double util_norm,
                                        int max_files = 5,
                                        unsigned seed = 42);
+
+// 自动探测 STG 数据布局并加载：
+//   - 若 base_dir 自身含 .stg 文件，直接加载
+//   - 否则扫描 base_dir 下所有子目录（含子目录中的 .stg）
+//     典型布局：base_dir/50/*.stg、base_dir/100/*.stg、base_dir/rnc50/*.stg
+// 返回按目录分组的结果（分组名即目录名，如 "50"、"100"）。
+struct StgGroup {
+    std::string label;          // 目录名或 "root"
+    std::vector<DAGTask> tasks; // 该目录下加载的 DAG（period=0，待 assign_period）
+};
+
+std::vector<StgGroup> load_stg_auto(const std::string &base_dir,
+                                     int max_files_per_group = -1,
+                                     unsigned seed = 42);
