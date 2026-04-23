@@ -5,9 +5,14 @@
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <unordered_set>
 
 // ======================== Job ========================
 // GEDF 仿真中的单个零散任务实例，带绝对释放/截止时间
+// 为正确处理 DAG 依赖，引入 ready_time：必须同时满足
+//   1) cur_time >= release_time
+//   2) 原 DAG 中该顶点的所有前驱顶点都已完成
+//   3) 同一顶点的上一个 segment 切片已完成
 struct Job {
     std::string job_id;
     int parent_task_id;
@@ -20,6 +25,16 @@ struct Job {
     double remaining;
     double finish_time = -1.0;
 
+    // --- DAG 依赖 ---
+    int pending_preds = 0;      // 还有多少个前驱 job 尚未完成
+    std::vector<Job*> unblocks; // 本 job 完成后需要通知的下游 job
+    bool released = false;      // 已经在 release_time 之后
+    bool in_ready = false;      // 已加入就绪队列
+
+    bool is_ready() const {
+        return released && pending_preds == 0 && remaining > EPS && finish_time < 0;
+    }
+
     bool operator>(const Job &o) const {
         if (std::abs(absolute_deadline - o.absolute_deadline) > EPS)
             return absolute_deadline > o.absolute_deadline;
@@ -28,7 +43,12 @@ struct Job {
 };
 
 // ======================== Simulation ========================
-// 主循环：按时间事件推进，先释放→整理就绪队列→EDF 分派→推进到下一事件
+// 主循环：按时间事件推进
+//   1) 到 release_time 的 job 先标记 released；
+//   2) 若同时 pending_preds == 0 则加入 ready 队列；
+//   3) EDF 选 m 个执行；
+//   4) 推进到下一事件（新 release 或 job 完成）；
+//   5) 完成的 job 递减下游 pending_preds，可能触发更多 ready。
 SimResult simulate_gedf(int m,
                          std::vector<DAGTask> &tasks,
                          std::vector<DecompositionResult> &decomps,
@@ -41,25 +61,27 @@ SimResult simulate_gedf(int m,
     for (auto &t : tasks) task_map[t.task_id] = &t;
     for (auto &d : decomps) decomp_map[d.task_id] = &d;
 
-    // 预生成所有释放事件，便于按时间排序处理
-    struct ReleaseEvent {
-        double time;
-        Job job;
-    };
-    std::vector<ReleaseEvent> releases;
-
     // DAG instance tracking
-    // key = "dag_{task_id}_{instance}"
     std::map<std::string, DAGInstance> dag_instances;
 
     double sim_duration = 0;
     for (auto &t : tasks)
         sim_duration = std::max(sim_duration, t.period * num_periods);
 
+    // 预分配所有 job：每个 (decomp, sporadic_task, k) 一个 Job
+    std::vector<std::unique_ptr<Job>> all_jobs;
+    std::unordered_map<std::string, Job*> job_map;
+
+    // 辅助索引: (task_id, instance, vertex_id) -> 本顶点的所有 segment job 指针（按 segment_id 升序）
+    struct VKey { int tid, inst, vid;
+        bool operator==(const VKey &o) const { return tid==o.tid && inst==o.inst && vid==o.vid; } };
+    struct VKeyHash { size_t operator()(const VKey &k) const {
+        return std::hash<long long>()(((long long)k.tid*131LL + k.inst)*131LL + k.vid); } };
+    std::unordered_map<VKey, std::vector<Job*>, VKeyHash> vertex_jobs;
+
     for (auto &d : decomps) {
         auto *task = task_map[d.task_id];
         for (int k = 0; k < num_periods; ++k) {
-            // DAG instance
             std::ostringstream key;
             key << "dag_" << d.task_id << "_" << k;
             DAGInstance di;
@@ -76,119 +98,152 @@ SimResult simulate_gedf(int m,
                 std::ostringstream jid;
                 jid << st.task_id << "_i" << k;
 
-                Job job;
-                job.job_id            = jid.str();
-                job.parent_task_id    = d.task_id;
-                job.vertex_id         = st.vertex_id;
-                job.segment_id        = st.segment_id;
-                job.instance          = k;
-                job.release_time      = abs_rel;
-                job.absolute_deadline = abs_dl;
-                job.wcet              = st.wcet;
-                job.remaining         = st.wcet;
+                auto jptr = std::make_unique<Job>();
+                Job *j = jptr.get();
+                j->job_id            = jid.str();
+                j->parent_task_id    = d.task_id;
+                j->vertex_id         = st.vertex_id;
+                j->segment_id        = st.segment_id;
+                j->instance          = k;
+                j->release_time      = abs_rel;
+                j->absolute_deadline = abs_dl;
+                j->wcet              = st.wcet;
+                j->remaining         = st.wcet;
 
-                releases.push_back({abs_rel, job});
-                di.job_ids.push_back(jid.str());
+                job_map[j->job_id] = j;
+                di.job_ids.push_back(j->job_id);
+                vertex_jobs[{d.task_id, k, st.vertex_id}].push_back(j);
+                all_jobs.push_back(std::move(jptr));
             }
             dag_instances[key.str()] = di;
         }
     }
 
-    // Sort releases
-    std::sort(releases.begin(), releases.end(),
-              [](auto &a, auto &b){ return a.time < b.time; });
+    // 建立 DAG 依赖：
+    //  (a) 同一顶点的多个 segment job 按 segment_id 升序串行；
+    //  (b) 顶点 v 的第一个 segment job 等其所有 DAG 前驱顶点的最后一个 segment job 完成。
+    for (auto &[vk, jobs] : vertex_jobs) {
+        // 按 segment_id 排序
+        std::sort(jobs.begin(), jobs.end(), [](Job *a, Job *b){
+            return a->segment_id < b->segment_id;
+        });
+        // 链式串行
+        for (size_t i = 1; i < jobs.size(); ++i) {
+            jobs[i-1]->unblocks.push_back(jobs[i]);
+            jobs[i]->pending_preds += 1;
+        }
+    }
+    // DAG 前驱依赖
+    for (auto &d : decomps) {
+        auto *task = task_map[d.task_id];
+        for (int k = 0; k < num_periods; ++k) {
+            for (auto &[vid, v] : task->vertices) {
+                auto it_cur = vertex_jobs.find({d.task_id, k, vid});
+                if (it_cur == vertex_jobs.end() || it_cur->second.empty()) continue;
+                Job *first = it_cur->second.front();
+                for (int p : v.preds) {
+                    auto it_p = vertex_jobs.find({d.task_id, k, p});
+                    if (it_p == vertex_jobs.end() || it_p->second.empty()) continue;
+                    Job *last_pred = it_p->second.back();
+                    last_pred->unblocks.push_back(first);
+                    first->pending_preds += 1;
+                }
+            }
+        }
+    }
+
+    // 预生成按 release_time 升序的指针列表
+    std::vector<Job*> releases_sorted;
+    releases_sorted.reserve(all_jobs.size());
+    for (auto &up : all_jobs) releases_sorted.push_back(up.get());
+    std::sort(releases_sorted.begin(), releases_sorted.end(),
+              [](Job *a, Job *b){ return a->release_time < b->release_time; });
 
     // Simulation state
-    std::vector<Job*> processors(m, nullptr);  // current job on each proc
-    std::vector<Job> ready;                     // ready queue
-    // Store all jobs for lifetime management
-    std::vector<std::unique_ptr<Job>> all_jobs;
-    // Map from job_id to Job*
-    std::unordered_map<std::string, Job*> job_map;
+    std::vector<Job*> processors(m, nullptr);
+    std::vector<Job*> ready;                   // 就绪队列（DAG 依赖已满足）
 
-    // Pre-create all jobs
-    for (auto &re : releases) {
-        auto jptr = std::make_unique<Job>(re.job);
-        job_map[re.job.job_id] = jptr.get();
-        all_jobs.push_back(std::move(jptr));
-    }
+    auto try_push_ready = [&](Job *j) {
+        if (!j->in_ready && j->is_ready()) {
+            j->in_ready = true;
+            ready.push_back(j);
+        }
+    };
 
     int rel_idx = 0;
     double cur_time = 0.0;
 
     while (cur_time < sim_duration + EPS) {
-        // 1. Release jobs at cur_time
-        while (rel_idx < (int)releases.size() &&
-               releases[rel_idx].time <= cur_time + EPS) {
-            Job *j = job_map[releases[rel_idx].job.job_id];
-            if (j->remaining > EPS) ready.push_back(*j);
+        // 1. 处理 release 事件
+        while (rel_idx < (int)releases_sorted.size() &&
+               releases_sorted[rel_idx]->release_time <= cur_time + EPS) {
+            Job *j = releases_sorted[rel_idx];
+            j->released = true;
+            try_push_ready(j);
             ++rel_idx;
         }
 
-        // 2. Collect all runnable: running + ready
-        std::vector<Job*> runnable;
+        // 2. 回收当前处理器上的 job 到 ready（EDF 需要重排）
         for (int p = 0; p < m; ++p) {
             if (processors[p]) {
-                // find this job in job_map
-                Job *j = job_map[processors[p]->job_id];
-                runnable.push_back(j);
+                Job *j = processors[p];
                 processors[p] = nullptr;
+                if (j->finish_time < 0 && j->remaining > EPS) {
+                    if (!j->in_ready) { j->in_ready = true; ready.push_back(j); }
+                }
             }
         }
-        for (auto &rj : ready) {
-            Job *j = job_map[rj.job_id];
-            if (j->remaining > EPS && j->finish_time < 0) {
-                // avoid duplicates
-                bool found = false;
-                for (auto *r : runnable) if (r->job_id == j->job_id) { found = true; break; }
-                if (!found) runnable.push_back(j);
-            }
-        }
-        ready.clear();
 
-        // Sort by EDF (earliest deadline first)
-        std::sort(runnable.begin(), runnable.end(),
+        // 3. EDF 排序 ready
+        std::sort(ready.begin(), ready.end(),
                   [](Job *a, Job *b){
                       if (std::abs(a->absolute_deadline - b->absolute_deadline) > EPS)
                           return a->absolute_deadline < b->absolute_deadline;
                       return a->job_id < b->job_id;
                   });
 
-        // Assign top m to processors
-        for (int i = 0; i < std::min(m, (int)runnable.size()); ++i)
-            processors[i] = runnable[i];
-
-        // Put rest back to ready
-        for (int i = m; i < (int)runnable.size(); ++i) {
-            Job rj = *runnable[i];
-            ready.push_back(rj);
+        // 4. 分配 top m 到处理器
+        int picked = std::min(m, (int)ready.size());
+        for (int i = 0; i < picked; ++i) {
+            processors[i] = ready[i];
+            ready[i]->in_ready = false;
         }
+        // 剩余保留在 ready（标记 in_ready=true）
+        std::vector<Job*> leftover(ready.begin() + picked, ready.end());
+        ready = std::move(leftover);
 
-        // 3. Find next event time
+        // 5. 找下一事件时间
         double next_time = sim_duration + 1;
-
-        // Next release
-        if (rel_idx < (int)releases.size())
-            next_time = std::min(next_time, releases[rel_idx].time);
-
-        // Next completion
+        if (rel_idx < (int)releases_sorted.size())
+            next_time = std::min(next_time, releases_sorted[rel_idx]->release_time);
         for (int p = 0; p < m; ++p) {
             if (processors[p])
                 next_time = std::min(next_time, cur_time + processors[p]->remaining);
         }
-
         if (next_time <= cur_time + EPS)
             next_time = cur_time + 1e-9;
+        if (next_time > sim_duration + EPS) break;
 
-        // 4. Advance: execute
+        // 6. 推进执行
         double dt = next_time - cur_time;
+        std::vector<Job*> just_finished;
         for (int p = 0; p < m; ++p) {
             if (!processors[p]) continue;
             processors[p]->remaining -= dt;
             if (processors[p]->remaining <= EPS) {
                 processors[p]->remaining = 0;
                 processors[p]->finish_time = next_time;
+                just_finished.push_back(processors[p]);
                 processors[p] = nullptr;
+            }
+        }
+
+        // 7. 完成触发下游 pending_preds 减一
+        for (Job *j : just_finished) {
+            for (Job *dn : j->unblocks) {
+                dn->pending_preds -= 1;
+                // 如果已 release 且前驱全部完成，加入 ready
+                if (dn->released) try_push_ready(dn);
             }
         }
 
@@ -215,6 +270,9 @@ SimResult simulate_gedf(int m,
                 result.schedulable = false;
                 ++result.deadline_misses;
             }
+        } else {
+            // 有 job 未完成视为不可调度
+            result.schedulable = false;
         }
     }
 
