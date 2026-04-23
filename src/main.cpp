@@ -371,8 +371,9 @@ static nlohmann::json run_variants_comparison() {
     nlohmann::json arr = nlohmann::json::array();
 
     for (double unorm : util_levels) {
-        int acc_gedf = 0, acc_np = 0, acc_ds = 0;
-        int acc_gedf_sim = 0, acc_np_sim = 0, acc_ds_sim = 0;
+        int acc_gedf = 0, acc_np = 0, acc_ds = 0, acc_r = 0;
+        int acc_gedf_sim = 0, acc_np_sim = 0, acc_ds_sim = 0,
+            acc_r_sim = 0, acc_rds_sim = 0;
         int valid = 0;
 
         for (int trial = 0; trial < n_trials; ++trial) {
@@ -395,10 +396,12 @@ static nlohmann::json run_variants_comparison() {
                 auto sg = check_schedulability_gedf(tasks, decomps, m);
                 auto sn = check_gedf_np(tasks, reassembled, m);  // reassembled!
                 auto sd = check_gedf_ds(tasks, decomps, m);      // no reassemble for DS
+                auto sr = check_gedf_r(tasks, decomps, m);       // 与 GEDF 条件相同
 
                 if (sg.schedulable) ++acc_gedf;
                 if (sn.schedulable) ++acc_np;
                 if (sd.schedulable) ++acc_ds;
+                if (sr.schedulable) ++acc_r;
 
                 // 仿真对比
                 auto sim_g = simulate_gedf(m, tasks, decomps, 3);
@@ -410,26 +413,39 @@ static nlohmann::json run_variants_comparison() {
                 auto sim_ds = simulate_gedf_ds(m, tasks, decomps, 3);
                 if (sim_ds.schedulable) ++acc_ds_sim;
 
+                // 新增：GEDF-R 与 GEDF-RDS 仿真
+                auto sim_r = simulate_gedf_r(m, tasks, decomps, 3);
+                if (sim_r.schedulable) ++acc_r_sim;
+
+                auto sim_rds = simulate_gedf_rds(m, tasks, decomps, 3);
+                if (sim_rds.schedulable) ++acc_rds_sim;
+
             } catch (...) { continue; }
         }
 
-        printf("  U/m=%.1f: valid=%d | GEDF=%d/%d NP=%d/%d DS=%d/%d (ana/sim)\n",
+        printf("  U/m=%.1f: valid=%d | GEDF=%d/%d NP=%d/%d DS=%d/%d R=%d/%d RDS=-/%d\n",
                unorm, valid,
                acc_gedf, acc_gedf_sim,
                acc_np, acc_np_sim,
-               acc_ds, acc_ds_sim);
+               acc_ds, acc_ds_sim,
+               acc_r, acc_r_sim, acc_rds_sim);
 
         arr.push_back({
             {"util_norm", unorm}, {"total_valid", valid},
             {"gedf_analytical", acc_gedf}, {"gedf_simulation", acc_gedf_sim},
             {"np_analytical", acc_np}, {"np_simulation", acc_np_sim},
             {"ds_analytical", acc_ds}, {"ds_simulation", acc_ds_sim},
+            {"r_analytical",  acc_r},  {"r_simulation",  acc_r_sim},
+            {"rds_simulation", acc_rds_sim},
             {"gedf_ratio", valid>0?(double)acc_gedf/valid:0.0},
             {"np_ratio", valid>0?(double)acc_np/valid:0.0},
             {"ds_ratio", valid>0?(double)acc_ds/valid:0.0},
+            {"r_ratio",  valid>0?(double)acc_r/valid:0.0},
             {"gedf_sim_ratio", valid>0?(double)acc_gedf_sim/valid:0.0},
             {"np_sim_ratio", valid>0?(double)acc_np_sim/valid:0.0},
-            {"ds_sim_ratio", valid>0?(double)acc_ds_sim/valid:0.0}
+            {"ds_sim_ratio", valid>0?(double)acc_ds_sim/valid:0.0},
+            {"r_sim_ratio",  valid>0?(double)acc_r_sim/valid:0.0},
+            {"rds_sim_ratio",valid>0?(double)acc_rds_sim/valid:0.0}
         });
     }
     return arr;
@@ -550,20 +566,33 @@ static nlohmann::json run_high_elasticity_and_overhead() {
 
                 auto decomps = decompose_taskset(tasks);
 
-                auto d_gedf = apply_overhead(decomps, cfg, SchedulerType::GEDF);
-                auto d_ds   = apply_overhead(decomps, cfg, SchedulerType::GEDF_DS);
-                auto d_r    = apply_overhead(decomps, cfg, SchedulerType::GEDF_R);
-                auto d_rds  = apply_overhead(decomps, cfg, SchedulerType::GEDF_RDS);
+                // 使用同步版本：tasks 的 C/L/U/Γ 会随开销一起更新，
+                // 避免理论判定仍用未含开销的旧值而产生乐观偏差。
+                auto s_gedf = apply_overhead_sync(tasks, decomps, cfg, SchedulerType::GEDF);
+                auto s_ds   = apply_overhead_sync(tasks, decomps, cfg, SchedulerType::GEDF_DS);
+                auto s_r    = apply_overhead_sync(tasks, decomps, cfg, SchedulerType::GEDF_R);
+                auto s_rds  = apply_overhead_sync(tasks, decomps, cfg, SchedulerType::GEDF_RDS);
+                auto s_np   = apply_overhead_sync(tasks, decomps, cfg, SchedulerType::GEDF_NP);
 
-                auto d_np_raw = apply_overhead(decomps, cfg, SchedulerType::GEDF_NP);
                 std::vector<DecompositionResult> d_np;
-                for (auto &d : d_np_raw) d_np.push_back(make_reassembled_decomp(d));
+                for (auto &d : s_np.decomps) d_np.push_back(make_reassembled_decomp(d));
 
-                if (check_schedulability_gedf(tasks, d_gedf, m).schedulable) ++acc_gedf;
-                if (check_gedf_ds(tasks, d_ds, m).schedulable) ++acc_ds;
-                if (check_gedf_r(tasks, d_r, m).schedulable) ++acc_r;
-                if (check_gedf_ds(tasks, d_rds, m).schedulable) ++acc_rds;
-                if (check_gedf_np(tasks, d_np, m).schedulable) ++acc_np;
+                // 开销加大后，原任务 L 可能超过 T，此时先用 U_Σ ≤ m 的必要条件过滤
+                auto usum_ok = [&](const std::vector<DAGTask> &ts) {
+                    double u = 0; for (auto &t : ts) { if (t.L > t.period+EPS) return false; u += t.U; }
+                    return u <= m + EPS;
+                };
+
+                if (usum_ok(s_gedf.tasks) &&
+                    check_schedulability_gedf(s_gedf.tasks, s_gedf.decomps, m).schedulable) ++acc_gedf;
+                if (usum_ok(s_ds.tasks) &&
+                    check_gedf_ds(s_ds.tasks, s_ds.decomps, m).schedulable) ++acc_ds;
+                if (usum_ok(s_r.tasks) &&
+                    check_gedf_r(s_r.tasks, s_r.decomps, m).schedulable) ++acc_r;
+                if (usum_ok(s_rds.tasks) &&
+                    check_gedf_ds(s_rds.tasks, s_rds.decomps, m).schedulable) ++acc_rds;
+                if (usum_ok(s_np.tasks) &&
+                    check_gedf_np(s_np.tasks, d_np, m).schedulable) ++acc_np;
             } catch (...) { continue; }
         }
 
@@ -589,7 +618,11 @@ static nlohmann::json run_high_elasticity_and_overhead() {
 }
 
 // =====================================================================
-//  Part 7: 精度评估（WCRT_sim / T_i）
+//  Part 7: 精度评估
+//    精度 = WCRT_sim / RT_bound，三种理论上界并列输出：
+//      - period  : T_i         (最宽松)
+//      - omega*T : Ω_i · T_i   (基于分解结构特征值，默认主指标)
+//      - graham  : L + (C-L)/m (Graham 型并行上界)
 // =====================================================================
 static nlohmann::json run_precision_evaluation() {
     cout << "\n" << std::string(70, '=') << endl;
@@ -600,7 +633,7 @@ static nlohmann::json run_precision_evaluation() {
     int n_trials = 30;
 
     nlohmann::json per_trial = nlohmann::json::array();
-    std::vector<double> all_precisions;
+    std::vector<double> prec_period, prec_omega, prec_graham;
 
     for (int trial = 0; trial < n_trials; ++trial) {
         unsigned seed = 7000 + trial * 71;
@@ -621,36 +654,72 @@ static nlohmann::json run_precision_evaluation() {
             for (auto &pr : prec) {
                 jt["tasks"].push_back({
                     {"task_id", pr.task_id}, {"wcrt_sim", pr.wcrt_sim},
-                    {"rt_bound", pr.rt_bound_theorem}, {"precision", pr.precision},
-                    {"period", pr.period}
+                    {"period", pr.period},
+                    {"rt_bound_period", pr.rt_bound_period},
+                    {"rt_bound_omega",  pr.rt_bound_omega},
+                    {"rt_bound_graham", pr.rt_bound_graham},
+                    {"precision_period", pr.precision_period},
+                    {"precision_omega",  pr.precision_omega},
+                    {"precision_graham", pr.precision_graham},
+                    // 兼容旧字段
+                    {"rt_bound", pr.rt_bound_theorem},
+                    {"precision", pr.precision}
                 });
-                if (pr.precision > EPS && pr.precision <= 1.0 + EPS)
-                    all_precisions.push_back(pr.precision);
+                auto collect = [](std::vector<double> &v, double x) {
+                    // 保留所有有效精度值；> 1 说明该上界失效（理论不安全），
+                    // 在统计里以独立分布呈现即可，不做截断过滤。
+                    if (x > EPS) v.push_back(x);
+                };
+                collect(prec_period, pr.precision_period);
+                collect(prec_omega,  pr.precision_omega);
+                collect(prec_graham, pr.precision_graham);
             }
             per_trial.push_back(jt);
         } catch (...) { continue; }
     }
 
-    double avg_prec = 0;
-    if (!all_precisions.empty()) {
-        for (double pp : all_precisions) avg_prec += pp;
-        avg_prec /= all_precisions.size();
-    }
-    double min_prec = all_precisions.empty() ? 0 : *std::min_element(all_precisions.begin(), all_precisions.end());
-    double max_prec = all_precisions.empty() ? 0 : *std::max_element(all_precisions.begin(), all_precisions.end());
+    auto stats = [](const std::vector<double> &v) {
+        nlohmann::json s;
+        if (v.empty()) {
+            s["avg"] = 0; s["min"] = 0; s["max"] = 0; s["n"] = 0;
+        } else {
+            double sum = 0; for (double x : v) sum += x;
+            s["avg"] = sum / v.size();
+            s["min"] = *std::min_element(v.begin(), v.end());
+            s["max"] = *std::max_element(v.begin(), v.end());
+            s["n"]   = (int)v.size();
+        }
+        return s;
+    };
 
     nlohmann::json j;
     j["per_trial"] = per_trial;
     j["summary"] = {
-        {"avg_precision", avg_prec}, {"min_precision", min_prec},
-        {"max_precision", max_prec}, {"n_samples", (int)all_precisions.size()}
+        {"period",  stats(prec_period)},
+        {"omega",   stats(prec_omega)},
+        {"graham",  stats(prec_graham)}
+    };
+    // 兼容旧 summary（以 Ω·T 为默认紧界）
+    auto so = stats(prec_omega);
+    j["summary"]["avg_precision"] = so["avg"];
+    j["summary"]["min_precision"] = so["min"];
+    j["summary"]["max_precision"] = so["max"];
+    j["summary"]["n_samples"]     = so["n"];
+
+    auto print_stats = [](const char *name, const nlohmann::json &s) {
+        printf("  %-8s  avg=%.2f%%  min=%.2f%%  max=%.2f%%  n=%d\n",
+               name,
+               (double)s["avg"] * 100,
+               (double)s["min"] * 100,
+               (double)s["max"] * 100,
+               (int)s["n"]);
     };
 
-    printf("\n  === Precision Summary ===\n");
-    printf("  Average: %.2f%%\n", avg_prec * 100);
-    printf("  Min:     %.2f%%\n", min_prec * 100);
-    printf("  Max:     %.2f%%\n", max_prec * 100);
-    printf("  Samples: %d\n", (int)all_precisions.size());
+    printf("\n  === Precision Summary (WCRT_sim / RT_bound) ===\n");
+    print_stats("period",  j["summary"]["period"]);
+    print_stats("omega*T", j["summary"]["omega"]);
+    print_stats("graham",  j["summary"]["graham"]);
+    printf("  (默认主指标: omega*T；开题目标: avg ≥ 80%%)\n");
 
     return j;
 }
@@ -658,79 +727,157 @@ static nlohmann::json run_precision_evaluation() {
 // =====================================================================
 //  Part 8: STG Dataset Validation
 // =====================================================================
-static nlohmann::json run_stg_experiment(const std::string &stg_dir) {
+//  Part 8: STG Dataset Validation
+//  - 自动识别布局（base_dir 直接含 .stg，或 base_dir/<size>/*.stg）
+//  - 对每个分组分别做「U/m 扫描 + 5 个算法对比 + 精度统计」
+// =====================================================================
+static nlohmann::json run_stg_experiment(const std::string &stg_dir,
+                                          int max_files_per_group,
+                                          const std::vector<std::string> &size_filter) {
     cout << "\n" << std::string(70, '=') << endl;
     cout << "PART 8: STG Dataset Validation (" << stg_dir << ")" << endl;
     cout << std::string(70, '=') << endl;
- 
+
     int m = 8;
-    auto stg_tasks_raw = load_stg_directory(stg_dir, 0.4, 10, 42);
-    if (stg_tasks_raw.empty()) {
-        printf("  No STG files found, skipping.\n");
+
+    // 先按 label 分组加载
+    auto groups = load_stg_auto(stg_dir, max_files_per_group, 42);
+    if (!size_filter.empty()) {
+        groups.erase(
+            std::remove_if(groups.begin(), groups.end(),
+                [&](const StgGroup &g) {
+                    return std::find(size_filter.begin(), size_filter.end(), g.label)
+                           == size_filter.end();
+                }),
+            groups.end());
+    }
+
+    if (groups.empty()) {
+        printf("  No STG files found under %s, skipping.\n", stg_dir.c_str());
         nlohmann::json j;
         j["status"] = "no_data";
         return j;
     }
-    printf("  Loaded %d DAGs from STG\n", (int)stg_tasks_raw.size());
- 
+
     nlohmann::json j;
-    j["num_dags"] = (int)stg_tasks_raw.size();
- 
-    double util_levels[] = {0.2, 0.3, 0.4, 0.5, 0.6};
-    nlohmann::json by_util = nlohmann::json::array();
- 
-    for (double u : util_levels) {
-        auto tasks = stg_tasks_raw;
-        std::mt19937 rng((unsigned)(u * 10000));
-        for (auto &t : tasks) assign_period(t, u, rng(), 3.0);
- 
-        // Keep subset with U_sum <= m
-        std::vector<DAGTask> subset;
-        double Usub = 0;
-        for (auto &t : tasks) {
-            if (t.L > t.period + EPS) continue;
-            if (Usub + t.U > m) break;
-            subset.push_back(t); Usub += t.U;
+    j["base_dir"] = stg_dir;
+
+    int total_dags = 0;
+    for (auto &g : groups) total_dags += (int)g.tasks.size();
+    j["num_dags_total"] = total_dags;
+
+    nlohmann::json groups_json = nlohmann::json::array();
+
+    double util_levels[] = {0.2, 0.3, 0.4, 0.5, 0.6, 0.7};
+
+    for (auto &grp : groups) {
+        printf("\n  [group=%s] %d DAGs loaded\n", grp.label.c_str(), (int)grp.tasks.size());
+
+        nlohmann::json g_json;
+        g_json["label"] = grp.label;
+        g_json["num_dags"] = (int)grp.tasks.size();
+        nlohmann::json by_util = nlohmann::json::array();
+
+        for (double u : util_levels) {
+            auto tasks = grp.tasks;
+            std::mt19937 rng((unsigned)(u * 10000) + std::hash<std::string>{}(grp.label));
+            for (auto &t : tasks) assign_period(t, u, rng(), 3.0);
+
+            // 挑子集：拒绝单任务就超 m 的情况，其余尽量装满
+            std::vector<DAGTask> subset;
+            double Usub = 0;
+            for (auto &t : tasks) {
+                if (t.L > t.period + EPS) continue;
+                if (t.U > m + EPS) continue;
+                if (Usub + t.U > m + EPS) continue;  // 改为 continue：允许后续小任务继续装
+                subset.push_back(t);
+                Usub += t.U;
+            }
+            if (subset.empty()) continue;
+
+            // 重新分配连续 task_id（避免 decompose_taskset 的 id 冲突）
+            for (int i = 0; i < (int)subset.size(); ++i) subset[i].task_id = i;
+
+            auto decomps = decompose_taskset(subset);
+
+            // --- 5 种算法理论 + 仿真 ---
+            std::vector<DecompositionResult> reassembled;
+            for (auto &d : decomps) reassembled.push_back(make_reassembled_decomp(d));
+
+            auto a_gedf = check_schedulability_gedf(subset, decomps, m);
+            auto a_np   = check_gedf_np(subset, reassembled, m);
+            auto a_ds   = check_gedf_ds(subset, decomps, m);
+            auto a_r    = check_gedf_r (subset, decomps, m);
+
+            auto s_gedf = simulate_gedf   (m, subset, decomps,  5);
+            auto s_np   = simulate_gedf_np(m, subset, reassembled, 3);
+            auto s_ds   = simulate_gedf_ds(m, subset, decomps,  3);
+            auto s_r    = simulate_gedf_r (m, subset, decomps,  3);
+            auto s_rds  = simulate_gedf_rds(m, subset, decomps, 3);
+
+            auto prec = evaluate_precision(subset, decomps, s_gedf, m);
+            double sum_o = 0, sum_p = 0, sum_g = 0; int pc = 0;
+            for (auto &p : prec) {
+                if (p.precision_omega > EPS && p.precision_omega <= 1.0 + EPS) {
+                    sum_o += p.precision_omega;
+                    sum_p += p.precision_period;
+                    sum_g += p.precision_graham;
+                    ++pc;
+                }
+            }
+            double avg_o = pc > 0 ? sum_o / pc : 0;
+            double avg_p = pc > 0 ? sum_p / pc : 0;
+            double avg_g = pc > 0 ? sum_g / pc : 0;
+
+            printf("  U/m=%.1f: n=%2d U_sum=%5.2f | "
+                   "ana[GEDF=%s NP=%s DS=%s R=%s] "
+                   "sim[GEDF=%s NP=%s DS=%s R=%s RDS=%s] prec(ΩT)=%.1f%%\n",
+                   u, (int)subset.size(), Usub,
+                   a_gedf.schedulable?"Y":"N", a_np.schedulable?"Y":"N",
+                   a_ds.schedulable?"Y":"N",   a_r.schedulable?"Y":"N",
+                   s_gedf.schedulable?"Y":"N", s_np.schedulable?"Y":"N",
+                   s_ds.schedulable?"Y":"N",   s_r.schedulable?"Y":"N",
+                   s_rds.schedulable?"Y":"N",  avg_o*100);
+
+            nlohmann::json entry;
+            entry["util_norm"] = u;
+            entry["n_tasks"]   = (int)subset.size();
+            entry["U_sum"]     = Usub;
+            entry["analytical"] = {
+                {"gedf", a_gedf.schedulable}, {"np", a_np.schedulable},
+                {"ds",   a_ds.schedulable},   {"r",  a_r.schedulable}
+            };
+            entry["simulation"] = {
+                {"gedf", s_gedf.schedulable}, {"np", s_np.schedulable},
+                {"ds",   s_ds.schedulable},   {"r",  s_r.schedulable},
+                {"rds",  s_rds.schedulable}
+            };
+            entry["avg_precision"] = avg_o;  // 默认 omega·T 紧界
+            entry["avg_precision_period"] = avg_p;
+            entry["avg_precision_omega"]  = avg_o;
+            entry["avg_precision_graham"] = avg_g;
+
+            nlohmann::json tasks_arr = nlohmann::json::array();
+            for (size_t i = 0; i < subset.size(); ++i) {
+                nlohmann::json tj;
+                tj["n_v"]  = (int)subset[i].vertices.size();
+                tj["C"]    = subset[i].C;
+                tj["L"]    = subset[i].L;
+                tj["T"]    = subset[i].period;
+                tj["U"]    = subset[i].U;
+                tj["omega"] = decomps[i].omega;
+                if (s_gedf.wcrt.count(subset[i].task_id))
+                    tj["wcrt"] = s_gedf.wcrt.at(subset[i].task_id);
+                tasks_arr.push_back(tj);
+            }
+            entry["tasks"] = tasks_arr;
+            by_util.push_back(entry);
         }
-        if (subset.empty()) continue;
- 
-        auto decomps = decompose_taskset(subset);
-        auto sched = check_schedulability_gedf(subset, decomps, m);
-        auto sim = simulate_gedf(m, subset, decomps, 5);
-        auto prec = evaluate_precision(subset, decomps, sim, m);
- 
-        double avg_p = 0; int pc = 0;
-        for (auto &p : prec)
-            if (p.precision > EPS && p.precision <= 1.0 + EPS) { avg_p += p.precision; ++pc; }
-        if (pc > 0) avg_p /= pc;
- 
-        printf("  U/m=%.1f: %d tasks, ana=%s sim=%s prec=%.1f%%\n",
-               u, (int)subset.size(), sched.schedulable?"Y":"N",
-               sim.schedulable?"Y":"N", avg_p*100);
- 
-        nlohmann::json entry;
-        entry["util_norm"] = u;
-        entry["n_tasks"] = (int)subset.size();
-        entry["analytical"] = sched.schedulable;
-        entry["simulation"] = sim.schedulable;
-        entry["avg_precision"] = avg_p;
-        nlohmann::json tasks_arr = nlohmann::json::array();
-        for (size_t i = 0; i < subset.size(); ++i) {
-            nlohmann::json tj;
-            tj["n_v"] = (int)subset[i].vertices.size();
-            tj["C"] = subset[i].C;
-            tj["L"] = subset[i].L;
-            tj["T"] = subset[i].period;
-            tj["U"] = subset[i].U;
-            tj["omega"] = decomps[i].omega;
-            if (sim.wcrt.count(subset[i].task_id))
-                tj["wcrt"] = sim.wcrt.at(subset[i].task_id);
-            tasks_arr.push_back(tj);
-        }
-        entry["tasks"] = tasks_arr;
-        by_util.push_back(entry);
+
+        g_json["by_util"] = by_util;
+        groups_json.push_back(g_json);
     }
-    j["by_util"] = by_util;
+    j["groups"] = groups_json;
     return j;
 }
 
@@ -833,6 +980,19 @@ int main(int argc, char *argv[]) {
     std::string output_path = "output/results.json";
     std::string stg_dir = "";
     std::string wf_path = "";
+    int stg_max = -1;                         // -1 = 全量
+    std::vector<std::string> stg_sizes;       // 空 = 全部分组
+
+    auto split_csv = [](const std::string &s) {
+        std::vector<std::string> out;
+        std::string cur;
+        for (char c : s) {
+            if (c == ',' || c == ';') { if (!cur.empty()) out.push_back(cur); cur.clear(); }
+            else cur.push_back(c);
+        }
+        if (!cur.empty()) out.push_back(cur);
+        return out;
+    };
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -842,6 +1002,10 @@ int main(int argc, char *argv[]) {
             wf_path = argv[++i];
         } else if (arg == "-o" && i + 1 < argc) {
             output_path = argv[++i];
+        } else if (arg == "--stg-max" && i + 1 < argc) {
+            stg_max = std::atoi(argv[++i]);
+        } else if (arg == "--stg-sizes" && i + 1 < argc) {
+            stg_sizes = split_csv(argv[++i]);
         } else if (output_path == "output/results.json") {
             output_path = arg;
         }
@@ -861,7 +1025,7 @@ int main(int argc, char *argv[]) {
 
     // STG 数据集实验
     if (!stg_dir.empty()) {
-        root["stg_experiment"] = run_stg_experiment(stg_dir);
+        root["stg_experiment"] = run_stg_experiment(stg_dir, stg_max, stg_sizes);
     }
 
     // WfInstances 数据集实验
