@@ -1,6 +1,8 @@
 # Bazel 构建配置
 build --cxxopt=-std=c++17
 build --host_cxxopt=-std=c++17
+build --macos_minimum_os=10.15
+build --cxxopt=-Wno-deprecated-declarations
 build --color=yes
 build --verbose_failures
 build --jobs=auto

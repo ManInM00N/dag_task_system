@@ -1,3 +1,5 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+
 package(default_visibility = ["//visibility:public"])
 
 # ======================== 头文件库 ========================
@@ -221,6 +223,23 @@ cc_test(
     copts = ["-std=c++17"],
     deps = [
         ":dag_generators",
+        ":test_utils",
+    ],
+)
+
+cc_test(
+    name = "stg_parser_test",
+    srcs = ["tests/stg_parser_test.cpp"],
+    includes = ["include"],
+    copts = ["-std=c++17"],
+    data = glob([
+        "data/stg/50/*.stg",
+        "data/stg/100/*.stg",
+        "data/stg/300/*.stg",
+    ], allow_empty = True),
+    deps = [
+        ":dag_model",
+        ":stg_parser",
         ":test_utils",
     ],
 )
