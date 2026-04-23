@@ -88,11 +88,18 @@ struct DAGTask {
         elasticity = (period > EPS) ? L / period : 0.0;
 
         // backward pass: fsh
+        // fsh(v) = 顶点 v 必须完成的最晚时刻
+        //   叶子: fsh = L  (隐式截止期下即任务截止期意义下的关键路径长度)
+        //   其他: fsh(v) = min_{s ∈ succs(v)} ( fsh(s) - c(s) )
+        // 这里保持 fsh ≤ L，便于与 rdy 一同构造分解段边界。
         for (auto it = topo.rbegin(); it != topo.rend(); ++it) {
             auto &v = vertices[*it];
             if (v.succs.empty()) { v.fsh = L; continue; }
             double mn = std::numeric_limits<double>::max();
-            for (int s : v.succs) mn = std::min(mn, vertices[s].rdy);
+            for (int s : v.succs) {
+                const auto &sv = vertices[s];
+                mn = std::min(mn, sv.fsh - sv.wcet);
+            }
             v.fsh = mn;
         }
     }
