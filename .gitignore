@@ -4,3 +4,12 @@ bazel-out/
 bazel-testlogs/
 bazel-dag_task_system/
 output/
+data/stg/**/
+out/
+bazel-bin/
+bazel-bin
+bazel-dag_task_system
+bazel-out
+bazel-testlogs
+README.pdf
+MODULE.bazel.lock
